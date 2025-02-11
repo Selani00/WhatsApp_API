@@ -1,156 +1,145 @@
-const {Client, LocalAuth} = require('whatsapp-web.js')
-const qrcode = require('qrcode-terminal')
+import pkg from 'whatsapp-web.js';
+const { Client, LocalAuth } = pkg;
+import qrcode from 'qrcode-terminal';
+import rabbitMQInstance from './RabbitMQService.js';
 
-const amqp = require('amqplib');
-
-const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://localhost:5672';
 const QUEUE_NAME = 'whatsapp_messages';
 
-const SPECIFIC_NUMBERS = ['94706028480', '94775249865']; 
+class WhatsAppClientSingleton {
+    constructor() {
+        if (WhatsAppClientSingleton.instance) {
+            return WhatsAppClientSingleton.instance;
+        }
+        this.client = new Client({
+            authStrategy: new LocalAuth({
+                clientId: 'client-one',
+                dataPath: './.wwebjs_auth'
+            }),
+            puppeteer: {
+                headless: 'new',
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--single-process',
+                    '--disable-gpu',
+                    '--disable-extensions',
+                    '--disable-software-rasterizer'
+                ],
+                defaultViewport: null,
+                timeout: 60000,
+                ignoreHTTPSErrors: true
+            },
+            restartOnAuthFail: true,
+            qrMaxRetries: 5,
+            authTimeoutMs: 60000,
+            takeoverOnConflict: true,
+            takeoverTimeoutMs: 60000
+        });
+        this.retries = 0;
+        this.maxRetries = 3;
+        WhatsAppClientSingleton.instance = this;
 
-const WhatsAppClient = new Client({
-    authStrategy: new LocalAuth({
-        clientId: 'client-one',
-        dataPath: './.wwebjs_auth'
-    }),
-    puppeteer: {
-        headless: 'new',
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process',
-            '--disable-gpu',
-            '--disable-extensions',
-            '--disable-software-rasterizer'
-        ],
-        defaultViewport: null,
-        timeout: 60000,
-        ignoreHTTPSErrors: true
-    },
-    restartOnAuthFail: true,
-    qrMaxRetries: 5,
-    authTimeoutMs: 60000,
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 60000
-})
+        // Initialize RabbitMQ channel
+        this.rabbitMQChannel = null;
+        this.initializeRabbitMQ();
 
-let retries = 0;
-const maxRetries = 3;
-const firstMessageMap = new Map();
+        // Register event listeners
+        this.registerEventListeners();
+    }
 
-const initializeClient = async () => {
-    try {
-        console.log('Initializing WhatsApp client...');
-        await WhatsAppClient.initialize();
-    } catch (error) {
-        console.error('Initialization error:', error);
-        if (retries < maxRetries) {
-            retries++;
-            console.log(`Retrying initialization (${retries}/${maxRetries})...`);
-            setTimeout(initializeClient, 5000);
-        } else {
-            console.error('Max retries reached. Could not initialize WhatsApp client.');
-            process.exit(1);
+    async initializeRabbitMQ() {
+        try {
+            const { channel } = await rabbitMQInstance.connect();
+            this.rabbitMQChannel = channel;
+            await this.rabbitMQChannel.assertQueue(QUEUE_NAME, { durable: false });
+            console.log('RabbitMQ channel initialized and ready.');
+        } catch (error) {
+            console.error('Error initializing RabbitMQ channel:', error);
         }
     }
-};
 
-WhatsAppClient.on('qr', (qr) => {
-    try {
-        console.log('QR Code received. Scan this QR code in WhatsApp to log in:');
-        qrcode.generate(qr, { small: true });
-    } catch (error) {
-        console.error('Error generating QR code:', error.message);
-    }
-})
-
-WhatsAppClient.on('ready', () => {
-    console.log('WhatsApp client is ready and connected!');
-    retries = 0;
-})
-
-WhatsAppClient.on('message', async (msg) => {
-    try {
-        // Log all incoming messages with sender info
-        const contact = await msg.getContact();
-        const chat = await msg.getChat();
-        
-        console.log({
-            from: contact.pushname || contact.number,  
-            number: msg.from,                         
-            message: msg.body,                        
-            timestamp: msg.timestamp,                 
-            chatName: chat.name                       
+    registerEventListeners() {
+        this.client.on('qr', (qr) => {
+            try {
+                console.log('QR Code received. Scan this QR code in WhatsApp to log in:');
+                qrcode.generate(qr, { small: true });
+            } catch (error) {
+                console.error('Error generating QR code:', error.message);
+            }
         });
 
-        // // If you still want to handle status broadcasts separately
-        // if (msg.from === 'status@broadcast') {
-        //     console.log('Status update received:', {
-        //         from: contact.pushname,
-        //         message: msg.body
-        //     });
-        // }
+        this.client.on('ready', () => {
+            console.log('WhatsApp client is ready and connected!');
+            this.retries = 0;
+        });
 
-        // // Check if this is the first message from the user
-        // if (!firstMessageMap.has(msg.from)) {
-        //     firstMessageMap.set(msg.from, true);
+        this.client.on('message', async (msg) => {
+            try {
+                const contact = await msg.getContact();
+                const chat = await msg.getChat();
 
-        //     // Send automatic reply
-        //     await msg.reply('Hello! How can I assist you today?');
-        // }
+                console.log({
+                    from: contact.pushname || contact.number,
+                    number: msg.from,
+                    message: msg.body,
+                    timestamp: msg.timestamp,
+                    chatName: chat.name
+                });
 
-        if (msg.body.toLowerCase() === 'hi' && SPECIFIC_NUMBERS.includes(msg.from.split('@')[0])) {
-            // Show typing indicator
-            await chat.sendStateTyping();
+                if (this.rabbitMQChannel) {
+                    await this.rabbitMQChannel.sendToQueue(QUEUE_NAME, Buffer.from(JSON.stringify({
+                        from: msg.from,
+                        message: msg.body,
+                        timestamp: msg.timestamp
+                    })));
+                    console.log('Message sent to RabbitMQ queue:', msg.body);
 
-            // Simulate a delay before sending the reply
-            const delay = Math.floor(Math.random() * 3000) + 2000;
+                    await this.rabbitMQChannel.checkQueue(QUEUE_NAME);
 
-            setTimeout(async () => {
-                // Send the reply message
-                await msg.reply('Hello! How can I assist you today?');
-                console.log('Replied to "hi" message after delay.');
-            }, delay);
-        }
+                } else {
+                    console.error('RabbitMQ channel is not initialized.');
+                }
+            } catch (err) {
+                console.error('Error processing incoming message:', err);
+            }
+        });
 
-        // Send the message to RabbitMQ
-        const connection = await amqp.connect(RABBITMQ_URL);
-        const channel = await connection.createChannel();
-        await channel.assertQueue(QUEUE_NAME, { durable: false });
-        await channel.sendToQueue(QUEUE_NAME, Buffer.from(JSON.stringify({
-            from: msg.from,
-            message: msg.body,
-            timestamp: msg.timestamp
-        })));
-        console.log('Message sent to RabbitMQ queue:', msg.body);
-        await channel.close();
-        await connection.close();
-        
-    } catch (err) {
-        console.error('Error processing incoming message:', err);
+        this.client.on('disconnected', async (reason) => {
+            console.log('WhatsApp client was disconnected:', reason);
+            this.retries = 0;
+            await this.initialize();
+        });
+
+        this.client.on('authenticated', () => {
+            console.log('WhatsApp client authenticated successfully!');
+        });
+
+        this.client.on('auth_failure', (msg) => {
+            console.error('WhatsApp authentication failed:', msg);
+        });
     }
-})
 
-WhatsAppClient.on('disconnected', async (reason) => {
-    console.log('WhatsApp client was disconnected:', reason);
-    retries = 0;
-    await initializeClient();
-})
+    async initialize() {
+        try {
+            console.log('Initializing WhatsApp client...');
+            await this.client.initialize();
+        } catch (error) {
+            console.error('Initialization error:', error);
+            if (this.retries < this.maxRetries) {
+                this.retries++;
+                console.log(`Retrying initialization (${this.retries}/${this.maxRetries})...`);
+                setTimeout(() => this.initialize(), 5000);
+            } else {
+                console.error('Max retries reached. Could not initialize WhatsApp client.');
+                process.exit(1);
+            }
+        }
+    }
+}
 
-WhatsAppClient.on('authenticated', () => {
-    console.log('WhatsApp client authenticated successfully!');
-})
-
-// Handle authentication failures
-WhatsAppClient.on('auth_failure', (msg) => {
-    console.error('WhatsApp authentication failed:', msg);
-})
-
-module.exports = {
-    client: WhatsAppClient,
-    initialize: initializeClient
-};
+const whatsAppClientInstance = new WhatsAppClientSingleton();
+export default whatsAppClientInstance;

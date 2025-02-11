@@ -1,6 +1,6 @@
 const express = require('express')
 const router = express.Router()
-const whatsapp = require('../service/WhatsAppClient')
+const whatsapp = require('../service/WhatsAppClient_')
 
 
 router.get('/', (req, res) => {
