@@ -1,6 +1,13 @@
 const {Client, LocalAuth} = require('whatsapp-web.js')
 const qrcode = require('qrcode-terminal')
 
+const amqp = require('amqplib');
+
+const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://localhost:5672';
+const QUEUE_NAME = 'whatsapp_messages';
+
+const SPECIFIC_NUMBERS = ['94706028480', '94775249865']; 
+
 const WhatsAppClient = new Client({
     authStrategy: new LocalAuth({
         clientId: 'client-one',
@@ -33,6 +40,7 @@ const WhatsAppClient = new Client({
 
 let retries = 0;
 const maxRetries = 3;
+const firstMessageMap = new Map();
 
 const initializeClient = async () => {
     try {
@@ -79,13 +87,49 @@ WhatsAppClient.on('message', async (msg) => {
             chatName: chat.name                       
         });
 
-        // If you still want to handle status broadcasts separately
-        if (msg.from === 'status@broadcast') {
-            console.log('Status update received:', {
-                from: contact.pushname,
-                message: msg.body
-            });
+        // // If you still want to handle status broadcasts separately
+        // if (msg.from === 'status@broadcast') {
+        //     console.log('Status update received:', {
+        //         from: contact.pushname,
+        //         message: msg.body
+        //     });
+        // }
+
+        // // Check if this is the first message from the user
+        // if (!firstMessageMap.has(msg.from)) {
+        //     firstMessageMap.set(msg.from, true);
+
+        //     // Send automatic reply
+        //     await msg.reply('Hello! How can I assist you today?');
+        // }
+
+        if (msg.body.toLowerCase() === 'hi' && SPECIFIC_NUMBERS.includes(msg.from.split('@')[0])) {
+            // Show typing indicator
+            await chat.sendStateTyping();
+
+            // Simulate a delay before sending the reply
+            const delay = Math.floor(Math.random() * 3000) + 2000;
+
+            setTimeout(async () => {
+                // Send the reply message
+                await msg.reply('Hello! How can I assist you today?');
+                console.log('Replied to "hi" message after delay.');
+            }, delay);
         }
+
+        // Send the message to RabbitMQ
+        const connection = await amqp.connect(RABBITMQ_URL);
+        const channel = await connection.createChannel();
+        await channel.assertQueue(QUEUE_NAME, { durable: false });
+        await channel.sendToQueue(QUEUE_NAME, Buffer.from(JSON.stringify({
+            from: msg.from,
+            message: msg.body,
+            timestamp: msg.timestamp
+        })));
+        console.log('Message sent to RabbitMQ queue:', msg.body);
+        await channel.close();
+        await connection.close();
+        
     } catch (err) {
         console.error('Error processing incoming message:', err);
     }

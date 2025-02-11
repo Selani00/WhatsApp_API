@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "amqplib": "^0.10.5",
     "express": "^4.21.2",
     "nodemon": "^3.1.9",
     "qrcode-terminal": "^0.12.0",
